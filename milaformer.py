@@ -1,6 +1,10 @@
 import torch
 import torch.nn as nn
 from timm.layers import DropPath, trunc_normal_
+import os
+from timm.models import register_model
+import math
+from torch.autograd import Variable
 
 
 def stemIQ(in_chs, out_chs):
@@ -586,3 +590,220 @@ class MILAFormer(nn.Module):
         x = self.norm(x)
         cls_out = self.head(self.globalavgpool(x))
         return cls_out
+
+
+# Architecture used for 1024-sample HisarMod inputs.
+
+
+class _MILAFormer_Encoder1024(nn.Module):
+    """
+    Input: tensor in shape [B, C, D]
+    Output: tensor in shape [B, C, D]
+    """
+
+    def __init__(
+        self,
+        dim,
+        mlp_ratio=4.0,
+        act_layer=nn.GELU,
+        drop=0.0,
+        drop_path=0.0,
+        use_layer_scale=True,
+        layer_scale_init_value=1e-05,
+        input_resolution=128,
+    ):
+        super().__init__()
+        self.local_representation = LocalRepresentation(
+            dim=dim, kernel_size=5, drop_path=0.0, use_layer_scale=True
+        )
+        self.attn = MLLABlock(dim=dim, input_resolution=input_resolution)
+        self.linear = FCN(
+            in_features=dim,
+            hidden_features=int(dim * mlp_ratio),
+            act_layer=act_layer,
+            drop=drop,
+        )
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        self.use_layer_scale = use_layer_scale
+        if use_layer_scale:
+            self.layer_scale_1 = nn.Parameter(
+                layer_scale_init_value * torch.ones(dim).unsqueeze(-1),
+                requires_grad=True,
+            )
+            self.layer_scale_2 = nn.Parameter(
+                layer_scale_init_value * torch.ones(dim).unsqueeze(-1),
+                requires_grad=True,
+            )
+
+    def forward(self, x):
+        x = self.local_representation(x)
+        if self.use_layer_scale:
+            x = x + self.drop_path(
+                self.layer_scale_1 * self.attn(x.permute(0, 2, 1)).permute(0, 2, 1)
+            )
+            x = x + self.drop_path(self.layer_scale_2 * self.linear(x))
+        else:
+            x = x + self.drop_path(self.attn(x.permute(0, 2, 1)).permute(0, 2, 1))
+            x = x + self.drop_path(self.linear(x))
+        return x
+
+
+def _Stage1024(
+    dim,
+    index,
+    layers,
+    mlp_ratio=4.0,
+    act_layer=nn.GELU,
+    drop_rate=0.0,
+    drop_path_rate=0.0,
+    use_layer_scale=True,
+    layer_scale_init_value=1e-05,
+    vit_num=1,
+    input_resolution=128,
+):
+    """
+    Input: tensor in shape [B, C, D]
+    Output: tensor in shape [B, C, D]
+    """
+    blocks = []
+    for block_idx in range(layers[index]):
+        block_dpr = (
+            drop_path_rate * (block_idx + sum(layers[:index])) / (sum(layers) - 1)
+        )
+        if layers[index] - block_idx <= vit_num:
+            blocks.append(
+                _MILAFormer_Encoder1024(
+                    dim,
+                    mlp_ratio=mlp_ratio,
+                    act_layer=act_layer,
+                    drop_path=block_dpr,
+                    use_layer_scale=use_layer_scale,
+                    layer_scale_init_value=layer_scale_init_value,
+                    input_resolution=input_resolution,
+                )
+            )
+        else:
+            blocks.append(
+                ConvEncoder(dim=dim, hidden_dim=int(mlp_ratio * dim), kernel_size=3)
+            )
+    blocks = nn.Sequential(*blocks)
+    return blocks
+
+
+class _MILAFormer1024(nn.Module):
+    def __init__(
+        self,
+        layers,
+        embed_dims=None,
+        mlp_ratios=4,
+        act_layer=nn.GELU,
+        num_classes=11,
+        down_patch_size=5,
+        down_stride=3,
+        down_pad=1,
+        drop_rate=0.0,
+        drop_path_rate=0.0,
+        use_layer_scale=True,
+        layer_scale_init_value=1e-05,
+        fork_feat=False,
+        vit_num=1,
+        input_resolution=128,
+    ):
+        super().__init__()
+        if not fork_feat:
+            self.num_classes = num_classes
+        self.fork_feat = fork_feat
+        self.BN = nn.BatchNorm1d(2)
+        self.patch_embedIQ = stemIQ(2, embed_dims[0] // 4)
+        self.fee = FEE(embed_dims[0] // 8, drop_rate)
+        network = []
+        for i in range(len(layers)):
+            stage = _Stage1024(
+                embed_dims[i],
+                i,
+                layers,
+                mlp_ratio=mlp_ratios,
+                act_layer=act_layer,
+                drop_rate=drop_rate,
+                drop_path_rate=drop_path_rate,
+                use_layer_scale=use_layer_scale,
+                layer_scale_init_value=layer_scale_init_value,
+                vit_num=vit_num,
+                input_resolution=input_resolution,
+            )
+            network.append(stage)
+            if i >= len(layers) - 1:
+                break
+            if embed_dims[i] != embed_dims[i + 1]:
+                network.append(
+                    Embedding(
+                        patch_size=down_patch_size,
+                        stride=down_stride,
+                        padding=down_pad,
+                        in_chans=embed_dims[i],
+                        embed_dim=embed_dims[i + 1],
+                    )
+                )
+        self.network = nn.ModuleList(network)
+        self.patch_LSTM = nn.LSTM(
+            input_size=embed_dims[0] // 8,
+            hidden_size=embed_dims[0] // 2,
+            bidirectional=True,
+            batch_first=True,
+            num_layers=2,
+            dropout=drop_rate,
+        )
+        self.norm = nn.BatchNorm1d(embed_dims[-1])
+        self.head = (
+            nn.Linear(embed_dims[-1], num_classes) if num_classes > 0 else nn.Identity()
+        )
+        self.apply(self._init_weights)
+        self.globalmaxpool = nn.Sequential(nn.AdaptiveMaxPool1d(1), nn.Flatten())
+        self.globalavgpool = nn.Sequential(nn.AdaptiveAvgPool1d(1), nn.Flatten())
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Conv1d):
+            trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def forward_tokens(self, x):
+        for idx, block in enumerate(self.network):
+            x = block(x)
+        return x
+
+    def forward(self, x):
+        x = self.BN(x)
+        x = self.patch_embedIQ(x)
+        x = self.fee(x)
+        x, _ = self.patch_LSTM(x.permute(0, 2, 1))
+        x = self.forward_tokens(x.permute(0, 2, 1))
+        x = self.norm(x)
+        cls_out = self.head(self.globalavgpool(x))
+        return cls_out
+
+
+def build_milaformer(num_classes, signal_length):
+    if signal_length not in (128, 1024):
+        raise ValueError("MILAFormer supports input lengths 128 and 1024")
+    constructor = MILAFormer if signal_length == 128 else _MILAFormer1024
+    kwargs = {} if signal_length == 128 else {"input_resolution": signal_length}
+    return constructor(
+        [2, 3, 2] if signal_length == 128 else [3, 3, 3],
+        embed_dims=[64, 64, 64],
+        mlp_ratios=4,
+        num_classes=num_classes,
+        down_patch_size=3,
+        down_stride=2,
+        down_pad=1,
+        drop_rate=0.2,
+        drop_path_rate=0.0,
+        use_layer_scale=False,
+        layer_scale_init_value=1e-5,
+        fork_feat=False,
+        vit_num=1,
+        **kwargs,
+    )

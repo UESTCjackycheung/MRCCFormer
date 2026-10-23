@@ -2,6 +2,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from timm.layers import DropPath, trunc_normal_
+import os
+import copy
+from timm.models import register_model
+import math
+from torch.autograd import Variable
 
 "\n《IQFormer: A Novel Transformer-Based Model With Multi-Modality Fusion for Automatic Modulation Recognition》\n"
 
@@ -476,26 +481,6 @@ def iq_former_128(num_classes: int, sig_size: int):
     return model
 
 
-def iq_former_1024(num_classes: int, sig_size: int):
-    model = IQFormer(
-        [3, 3, 3],
-        embed_dims=[64, 64, 64],
-        mlp_ratios=4,
-        act_layer=nn.GELU,
-        num_classes=num_classes,
-        down_patch_size=3,
-        down_stride=2,
-        down_pad=1,
-        drop_rate=0.2,
-        drop_path_rate=0.2,
-        use_layer_scale=False,
-        layer_scale_init_value=1e-05,
-        fork_feat=False,
-        vit_num=1,
-    )
-    return model
-
-
 class IQFormerFromIQ(nn.Module):
     """Build IQFormer's STFT branch deterministically from the raw I/Q batch.
 
@@ -527,5 +512,159 @@ class IQFormerFromIQ(nn.Module):
         return self.core((iq, self.make_stft(iq)))
 
 
-def build_iqformer(num_classes: int, sig_size: int) -> IQFormerFromIQ:
-    return IQFormerFromIQ(num_classes=num_classes, sig_size=sig_size)
+HISARMOD_CONV_ENCODERS = (2, 2, 2)
+HISARMOD_WINDOW_WIDTH = 61
+HISARMOD_FFT_LENGTH = 128
+
+
+class _IQFormer1024(nn.Module):
+    def __init__(
+        self,
+        layers,
+        embed_dims=None,
+        mlp_ratios=4,
+        act_layer=nn.GELU,
+        num_classes=11,
+        down_patch_size=5,
+        down_stride=3,
+        down_pad=1,
+        drop_rate=0.0,
+        drop_path_rate=0.0,
+        use_layer_scale=True,
+        layer_scale_init_value=1e-05,
+        fork_feat=False,
+        vit_num=1,
+    ):
+        super().__init__()
+        if not fork_feat:
+            self.num_classes = num_classes
+        self.fork_feat = fork_feat
+        self.BN = nn.BatchNorm1d(2)
+        self.BN_stft = nn.BatchNorm2d(1)
+        self.patch_embedIQ = stemIQ(2, embed_dims[0] // 4)
+        self.patch_embedSTFT = stemSTFT(32, 1, embed_dims[0] // 4)
+        self.fusion = Fusion(embed_dims[0] // 4, drop_rate)
+        network = []
+        for i in range(len(layers)):
+            stage = Stage(
+                embed_dims[i],
+                i,
+                layers,
+                mlp_ratio=mlp_ratios,
+                act_layer=act_layer,
+                drop_rate=drop_rate,
+                drop_path_rate=drop_path_rate,
+                use_layer_scale=use_layer_scale,
+                layer_scale_init_value=layer_scale_init_value,
+                vit_num=vit_num,
+            )
+            network.append(stage)
+            if i >= len(layers) - 1:
+                break
+            if embed_dims[i] != embed_dims[i + 1]:
+                network.append(
+                    Embedding(
+                        patch_size=down_patch_size,
+                        stride=down_stride,
+                        padding=down_pad,
+                        in_chans=embed_dims[i],
+                        embed_dim=embed_dims[i + 1],
+                    )
+                )
+        self.network = nn.ModuleList(network)
+        self.patch_LSTM = nn.LSTM(
+            input_size=embed_dims[0] // 2,
+            hidden_size=embed_dims[0] // 2,
+            bidirectional=True,
+            batch_first=True,
+            num_layers=2,
+            dropout=drop_rate,
+        )
+        self.norm = nn.BatchNorm1d(embed_dims[-1])
+        self.head = (
+            nn.Linear(embed_dims[-1], num_classes) if num_classes > 0 else nn.Identity()
+        )
+        self.apply(self._init_weights)
+        self.globalmaxpool = nn.Sequential(nn.AdaptiveMaxPool1d(1), nn.Flatten())
+        self.globalavgpool = nn.Sequential(nn.AdaptiveAvgPool1d(1), nn.Flatten())
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Conv1d):
+            trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def forward_tokens(self, x):
+        for idx, block in enumerate(self.network):
+            x = block(x)
+        return x
+
+    def forward(self, x, stft):
+        x = self.BN(x)
+        stft = self.BN_stft(stft)
+        x = self.patch_embedIQ(x)
+        stft = torch.squeeze(self.patch_embedSTFT(stft), dim=2)
+        x = self.fusion(x, stft)
+        x, _ = self.patch_LSTM(x.permute(0, 2, 1))
+        x = self.forward_tokens(x.permute(0, 2, 1))
+        x = self.norm(x)
+        cls_out = self.head(self.globalavgpool(x))
+        return cls_out
+
+
+def iq_former_1024(num_classes: int) -> _IQFormer1024:
+    total_blocks = [number + 1 for number in HISARMOD_CONV_ENCODERS]
+    return _IQFormer1024(
+        total_blocks,
+        embed_dims=[64, 64, 64],
+        mlp_ratios=4,
+        act_layer=nn.GELU,
+        num_classes=num_classes,
+        down_patch_size=3,
+        down_stride=2,
+        down_pad=1,
+        drop_rate=0.2,
+        drop_path_rate=0.2,
+        use_layer_scale=False,
+        layer_scale_init_value=1e-05,
+        fork_feat=False,
+        vit_num=1,
+    )
+
+
+class _IQFormerFromIQ1024(nn.Module):
+    """Generate the public IQFormer's STFT modality from each I/Q batch."""
+
+    def __init__(self, num_classes: int, sig_size: int):
+        super().__init__()
+        if sig_size != 1024:
+            raise ValueError("HisarMod IQFormer expects 1024-sample inputs.")
+        self.core = iq_former_1024(num_classes)
+        self.register_buffer(
+            "stft_window",
+            torch.blackman_window(HISARMOD_WINDOW_WIDTH, periodic=True),
+            persistent=False,
+        )
+
+    def make_stft(self, iq: torch.Tensor) -> torch.Tensor:
+        half_window = HISARMOD_WINDOW_WIDTH // 2
+        in_phase = F.pad(iq[:, 0], (half_window, half_window))
+        frames = in_phase.unfold(-1, HISARMOD_WINDOW_WIDTH, 1)
+        window = self.stft_window.to(device=iq.device, dtype=iq.dtype)
+        spectrum = torch.fft.rfft(frames * window, n=HISARMOD_FFT_LENGTH, dim=-1).real
+        spectrum = spectrum / window.sum().clamp_min(1e-12)
+        return spectrum[..., :32].transpose(1, 2).unsqueeze(1)
+
+    def forward(self, iq: torch.Tensor) -> torch.Tensor:
+        return self.core(iq, self.make_stft(iq))
+
+
+def build_iqformer(num_classes, sig_size):
+    if sig_size == 128:
+        return IQFormerFromIQ(num_classes=num_classes, sig_size=sig_size)
+    if sig_size == 1024:
+        return _IQFormerFromIQ1024(num_classes=num_classes, sig_size=sig_size)
+    raise ValueError("IQFormer supports input lengths 128 and 1024")
