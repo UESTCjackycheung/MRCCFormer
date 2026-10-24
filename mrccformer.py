@@ -1,4 +1,4 @@
-"""MRPureCumFormer for raw I/Q modulation classification."""
+"""MRCCFrormer for raw I/Q modulation classification."""
 
 from __future__ import annotations
 import torch
